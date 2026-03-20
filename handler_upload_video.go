@@ -1,17 +1,31 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
+	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
 	"github.com/google/uuid"
 )
+
+type FFProbeVideo struct {
+	Streams []videoStream `json:"streams"`
+}
+
+type videoStream struct {
+	Width  int `json:"width"`
+	Height int `json:"height"`
+}
 
 func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request) {
 	const max_upload_size = 1 << 30 // 1 GB
@@ -68,7 +82,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		respondWithError(w, http.StatusBadRequest, "Unsupported media type. Only MP4 and WebM are allowed", nil)
 		return
 	}
-
+	
 	file, err := os.CreateTemp("", "tubely-upload-*.mp4")
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't create temporary file", err)
@@ -88,9 +102,17 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 
 	randChars := base64.RawURLEncoding.EncodeToString(randVals)
 
+	aspectRatio, err := getVideoAspectRatio(file.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't get video aspect ratio", err)
+		return
+	}
+
+	videoKey := aspectRatio + randChars
+
 	_, err = cfg.s3Client.PutObject(r.Context(), &s3.PutObjectInput{
 		Bucket:      &cfg.s3Bucket,
-		Key:         &randChars,
+		Key:         &videoKey,
 		Body:        file,
 		ContentType: &mediaType,
 	})
@@ -99,8 +121,57 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	videoURL := "https://" + cfg.s3Bucket + ".s3." + cfg.s3Region + ".amazonaws.com/" + randChars
+	videoURL := "https://" + cfg.s3Bucket + ".s3." + cfg.s3Region + ".amazonaws.com/" + videoKey
 	video.VideoURL = &videoURL
 
 	cfg.db.UpdateVideo(video)
+}
+
+func getVideoAspectRatio(filePath string) (string, error) {
+	cmd := exec.Command("ffprobe", "-v", "error", "-print_format", "json", "-show_streams", filePath)
+
+	buffer := &bytes.Buffer{}
+	errBuffer := &bytes.Buffer{}
+
+	cmd.Stdout = buffer
+	cmd.Stderr = errBuffer
+
+	err := cmd.Run()
+	if err != nil {
+		return "", fmt.Errorf("ffprobe error: %v, stderr: %s", err, errBuffer.String())
+	}
+
+	var output FFProbeVideo
+
+	err = json.Unmarshal(buffer.Bytes(), &output)
+	if err != nil {
+		return "", err
+	}
+
+	if len(output.Streams) == 0 {
+		return "", fmt.Errorf("no video streams found")
+	}
+
+	width := output.Streams[0].Width
+	height := output.Streams[0].Height
+
+	aspectRatio := float64(width) / float64(height)
+
+	if areFloatsSimilar(aspectRatio, 16.0/9.0) {
+		return "landscape/", nil
+	} else if areFloatsSimilar(aspectRatio, 9.0/16.0) {
+		return "portrait/", nil
+	} else {
+		return "other/", nil
+	}
+}
+
+func areFloatsSimilar(a, b float64) bool {
+	// If they are exactly equal (e.g., comparing 2.0 and 2.0), return true immediately.
+	if a == b {
+		return true
+	}
+	
+	// Check if the absolute difference is less than or equal to tolerance.
+	return math.Abs(a-b) <= 0.1
 }
