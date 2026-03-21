@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -12,9 +13,12 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
+	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/database"
 	"github.com/google/uuid"
 )
 
@@ -136,10 +140,16 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	videoURL := "https://" + cfg.s3Bucket + ".s3." + cfg.s3Region + ".amazonaws.com/" + videoKey
+	videoURL := cfg.s3Bucket + "," + videoKey
 	video.VideoURL = &videoURL
 
 	cfg.db.UpdateVideo(video)
+
+	video, err = cfg.dbVideoToSignedVideo(video)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't generate signed URL for video", err)
+		return
+	}
 }
 
 func getVideoAspectRatio(filePath string) (string, error) {
@@ -202,4 +212,41 @@ func processVideoForFastStart(filePath string) (string, error) {
 	}
 
 	return newOutputPath, nil
+}
+
+func generatePresignedURL(s3Client *s3.Client, bucket, key string, expireTime time.Duration) (string, error) {
+	signedClient := s3.NewPresignClient(s3Client)
+
+	presignResult, err := signedClient.PresignGetObject(context.TODO(), &s3.GetObjectInput{
+		Bucket: &bucket,
+		Key:    &key,
+	}, s3.WithPresignExpires(expireTime))
+	if err != nil {
+		return "", fmt.Errorf("failed to generate presigned URL: %v", err)
+	}
+
+	return presignResult.URL, nil
+}
+
+func (cfg *apiConfig) dbVideoToSignedVideo(video database.Video) (database.Video, error) {
+	if video.VideoURL == nil {
+		return video, nil
+	}
+
+	parts := strings.SplitN(*video.VideoURL, ",", 2)
+	if len(parts) != 2 {
+		return video, fmt.Errorf("invalid video URL format")
+	}
+
+	bucket := parts[0]
+	key := parts[1]
+
+	signedURL, err := generatePresignedURL(cfg.s3Client, bucket, key, 15*time.Minute)
+	if err != nil {
+		return video, fmt.Errorf("failed to generate presigned URL: %v", err)
+	}
+
+	video.VideoURL = &signedURL
+
+	return video, nil
 }
